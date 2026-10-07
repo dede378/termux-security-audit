@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-termux-security-audit v0.7.0
+termux-security-audit v0.7.1
 Authorized web security audit pipeline for Termux:
 HTTP discovery -> Nmap -> Nuclei -> CVE extraction -> SearchSploit correlation.
 This tool reports evidence and candidates. It does not exploit targets.
@@ -20,10 +20,14 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
-VERSION = "0.7.0"
-MAX_URLS = 150
-MAX_DEPTH = 3
-TIMEOUT = 10
+VERSION = "0.7.1"
+MAX_URLS = 100
+MAX_DEPTH = 2
+TIMEOUT = 6
+NUCLEI_MAX_TARGETS = 20
+NUCLEI_CONCURRENCY = 10
+NUCLEI_BULK_SIZE = 10
+NUCLEI_RATE_LIMIT = 20
 
 COMMON_PATHS = [
     "/robots.txt", "/sitemap.xml", "/login", "/login.php", "/admin",
@@ -242,24 +246,46 @@ def run_nmap(target, workdir):
     return {"returncode": rc, "stdout": stdout, "stderr": stderr,
             "xml": str(xml_path), "open_ports": services}
 
-def run_nuclei(target, targets, workdir):
-    runs = []
-    direct = workdir / "nuclei-direct.jsonl"
-    rc, stdout, stderr = run_command(
-        ["nuclei", "-u", target, "-jsonl", "-o", str(direct)], timeout=600)
-    runs.append({"mode": "direct", "returncode": rc, "stdout": stdout,
-                 "stderr": stderr, "output": str(direct)})
+def select_nuclei_targets(target, urls, parameters):
+    """Choose a small, high-value endpoint set for phone-friendly scanning."""
+    selected = [target]
+    dynamic = []
+    interesting = []
+    for item in urls:
+        url = item["url"]
+        if url == target:
+            continue
+        if url in parameters or "?" in url:
+            dynamic.append(url)
+        path = urlparse(url).path.lower()
+        if any(token in path for token in (
+            "/login", "/admin", "/api", "/search", "/upload", "/debug",
+            "/labs/", "/phpinfo", "/server-status", "/redirect", "/profile"
+        )):
+            interesting.append(url)
+    for url in dynamic + interesting + [x["url"] for x in urls]:
+        if url not in selected:
+            selected.append(url)
+        if len(selected) >= NUCLEI_MAX_TARGETS:
+            break
+    return selected
 
-    if targets:
-        target_file = workdir / "nuclei_targets.txt"
-        target_file.write_text("\n".join(targets) + "\n", encoding="utf-8")
-        discovered = workdir / "nuclei-discovery.jsonl"
-        rc, stdout, stderr = run_command(
-            ["nuclei", "-list", str(target_file), "-jsonl", "-o", str(discovered)],
-            timeout=900)
-        runs.append({"mode": "discovery", "returncode": rc, "stdout": stdout,
-                     "stderr": stderr, "output": str(discovered)})
-    return runs
+def run_nuclei(targets, workdir):
+    target_file = workdir / "nuclei_targets.txt"
+    target_file.write_text("\n".join(targets) + "\n", encoding="utf-8")
+    output = workdir / "nuclei.jsonl"
+    args = [
+        "nuclei", "-list", str(target_file), "-jsonl", "-o", str(output),
+        "-c", str(NUCLEI_CONCURRENCY),
+        "-bs", str(NUCLEI_BULK_SIZE),
+        "-rl", str(NUCLEI_RATE_LIMIT),
+        "-stats", "-si", "15",
+    ]
+    rc, stdout, stderr = run_command(args, timeout=900)
+    return [{"mode": "selected", "returncode": rc, "stdout": stdout,
+             "stderr": stderr, "output": str(output), "targets": len(targets),
+             "concurrency": NUCLEI_CONCURRENCY, "bulk_size": NUCLEI_BULK_SIZE,
+             "rate_limit": NUCLEI_RATE_LIMIT}]
 
 def load_nuclei(files):
     raw = []
@@ -370,7 +396,7 @@ def searchsploit_fingerprint(nmap_result, searchsploit_bin):
     return candidates
 
 def main():
-    p = argparse.ArgumentParser(description="Termux web security auditor v0.7.0")
+    p = argparse.ArgumentParser(description="Termux web security auditor v0.7.1")
     p.add_argument("target", help="Authorized target URL or hostname")
     p.add_argument("-o", "--output", default="audit-report.json")
     args = p.parse_args()
@@ -392,7 +418,7 @@ def main():
         print("SearchSploit lookup paths: PATH, ~/bin/searchsploit, ~/exploit-database/searchsploit")
         return 2
 
-    workdir = Path(".audit-v0.7")
+    workdir = Path(".audit-v0.7.1")
     workdir.mkdir(exist_ok=True)
 
     print(f"TERMUX SECURITY AUDIT v{VERSION}")
@@ -409,14 +435,15 @@ def main():
     print(f"      Discovered URLs: {len(urls)}")
     print(f"      Parameterized endpoints: {len(parameters)}")
 
-    target_urls = list(dict.fromkeys([target] + [x["url"] for x in urls]))
+    target_urls = select_nuclei_targets(target, urls, parameters)
+    print(f"      Nuclei targets selected: {len(target_urls)} (max {NUCLEI_MAX_TARGETS})")
 
     print("[2/4] Running Nmap...")
     nmap = run_nmap(parsed.hostname, workdir)
     print(f"      Open ports: {len(nmap['open_ports'])}")
 
     print("[3/4] Running Nuclei...")
-    nuclei_runs = run_nuclei(target, target_urls, workdir)
+    nuclei_runs = run_nuclei(target_urls, workdir)
     nuclei_files = [x["output"] for x in nuclei_runs if Path(x["output"]).exists()]
     findings = load_nuclei(nuclei_files)
     print(f"      Unique findings: {len(findings)}")
