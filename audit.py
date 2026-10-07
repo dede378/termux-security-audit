@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""
+termux-security-audit v0.6
+Authorized web security audit pipeline for Termux:
+HTTP discovery -> Nmap -> Nuclei -> CVE extraction -> SearchSploit correlation.
+This tool reports evidence and candidates. It does not exploit targets.
+"""
+import argparse
+import json
+import re
+import shutil
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+from collections import Counter, deque
+from datetime import datetime, timezone
+from html.parser import HTMLParser
+from pathlib import Path
+from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.request import Request, urlopen
+
+VERSION = "0.6"
+MAX_URLS = 150
+MAX_DEPTH = 2
+TIMEOUT = 10
+
+COMMON_PATHS = [
+    "/robots.txt", "/sitemap.xml", "/login", "/login.php", "/admin",
+    "/admin.php", "/dashboard", "/register", "/register.php", "/signup",
+    "/search", "/search.php", "/api", "/api/", "/docs", "/debug",
+    "/server-status", "/phpinfo.php", "/info.php", "/test", "/backup",
+    "/uploads/",
+]
+
+class LinkParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links = []
+        self.forms = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag in ("a", "link"):
+            value = attrs.get("href")
+            if value:
+                self.links.append(value)
+        elif tag == "script":
+            value = attrs.get("src")
+            if value:
+                self.links.append(value)
+        elif tag == "form":
+            value = attrs.get("action") or ""
+            self.forms.append(value)
+
+def normalize_url(base, value):
+    if not value:
+        return None
+    value = value.strip()
+    if not value or value.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
+        return None
+    absolute = urljoin(base, value)
+    p = urlparse(absolute)
+    if p.scheme not in ("http", "https") or not p.netloc:
+        return None
+    return urlunparse((p.scheme, p.netloc, p.path or "/", "", p.query, ""))
+
+def same_origin(url, origin):
+    a, b = urlparse(url), urlparse(origin)
+    return a.scheme == b.scheme and a.netloc.lower() == b.netloc.lower()
+
+def fetch(url):
+    req = Request(url, headers={
+        "User-Agent": "termux-security-audit/0.6",
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+    })
+    with urlopen(req, timeout=TIMEOUT) as r:
+        return r.geturl(), r.status, r.headers.get("Content-Type", ""), r.read()
+
+def discover(target):
+    queue = deque([(target, 0)])
+    seen, discovered, errors = set(), [], []
+
+    while queue and len(discovered) < MAX_URLS:
+        current, depth = queue.popleft()
+        current = normalize_url(target, current)
+        if not current or current in seen or not same_origin(current, target):
+            continue
+        seen.add(current)
+        try:
+            final_url, status, content_type, body = fetch(current)
+        except Exception as exc:
+            errors.append({"url": current, "error": str(exc)})
+            continue
+
+        final_url = normalize_url(target, final_url) or current
+        seen.add(final_url)
+        discovered.append({
+            "url": final_url, "depth": depth, "status": status,
+            "content_type": content_type, "source": "crawl"
+        })
+
+        if depth >= MAX_DEPTH or "html" not in content_type.lower():
+            continue
+
+        parser = LinkParser()
+        parser.feed(body.decode("utf-8", errors="ignore"))
+        for raw in parser.links + parser.forms:
+            child = normalize_url(final_url, raw)
+            if child and same_origin(child, target) and child not in seen:
+                queue.append((child, depth + 1))
+
+    for path in COMMON_PATHS:
+        if len(discovered) >= MAX_URLS:
+            break
+        candidate = normalize_url(target, path)
+        if not candidate or candidate in seen:
+            continue
+        try:
+            final_url, status, content_type, _ = fetch(candidate)
+            final_url = normalize_url(target, final_url) or candidate
+            seen.update((candidate, final_url))
+            discovered.append({
+                "url": final_url, "depth": 1, "status": status,
+                "content_type": content_type, "source": "common-path"
+            })
+        except Exception as exc:
+            errors.append({"url": candidate, "error": str(exc)})
+
+    unique, used = [], set()
+    for item in discovered:
+        if item["url"] not in used:
+            used.add(item["url"])
+            unique.append(item)
+    return unique[:MAX_URLS], errors
+
+def run_command(args, timeout=None):
+    try:
+        r = subprocess.run(args, text=True, capture_output=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except FileNotFoundError:
+        return 127, "", f"command not found: {args[0]}"
+    except subprocess.TimeoutExpired as exc:
+        return 124, exc.stdout or "", (exc.stderr or "") + "\ncommand timed out"
+
+def run_nmap(target, workdir):
+    xml_path = workdir / "nmap.xml"
+    rc, stdout, stderr = run_command(
+        ["nmap", "-Pn", "-sV", "-p", "80,443,8000,8008,8080,8443",
+         "-oX", str(xml_path), target], timeout=180)
+
+    services = []
+    if xml_path.exists():
+        try:
+            root = ET.parse(xml_path).getroot()
+            for port in root.findall(".//port"):
+                state = port.find("state")
+                if state is None or state.get("state") != "open":
+                    continue
+                service = port.find("service")
+                services.append({
+                    "port": int(port.get("portid", "0")),
+                    "protocol": port.get("protocol"),
+                    "service": service.get("name") if service is not None else None,
+                    "product": service.get("product") if service is not None else None,
+                    "version": service.get("version") if service is not None else None,
+                    "extrainfo": service.get("extrainfo") if service is not None else None,
+                    "cpe": [x.text for x in service.findall("cpe")] if service is not None else [],
+                })
+        except Exception as exc:
+            stderr += f"\nNmap XML parse error: {exc}"
+    return {"returncode": rc, "stdout": stdout, "stderr": stderr,
+            "xml": str(xml_path), "open_ports": services}
+
+def run_nuclei(target, targets, workdir):
+    runs = []
+    direct = workdir / "nuclei-direct.jsonl"
+    rc, stdout, stderr = run_command(
+        ["nuclei", "-u", target, "-jsonl", "-o", str(direct)], timeout=600)
+    runs.append({"mode": "direct", "returncode": rc, "stdout": stdout,
+                 "stderr": stderr, "output": str(direct)})
+
+    if targets:
+        target_file = workdir / "nuclei_targets.txt"
+        target_file.write_text("\n".join(targets) + "\n", encoding="utf-8")
+        discovered = workdir / "nuclei-discovery.jsonl"
+        rc, stdout, stderr = run_command(
+            ["nuclei", "-list", str(target_file), "-jsonl", "-o", str(discovered)],
+            timeout=900)
+        runs.append({"mode": "discovery", "returncode": rc, "stdout": stdout,
+                     "stderr": stderr, "output": str(discovered)})
+    return runs
+
+def load_nuclei(files):
+    raw = []
+    for filename in files:
+        path = Path(filename)
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            try:
+                if line.strip():
+                    raw.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+
+    dedup = {}
+    for item in raw:
+        info = item.get("info") or {}
+        classification = info.get("classification") or {}
+        cves = classification.get("cve-id") or []
+        if isinstance(cves, str):
+            cves = [cves]
+        template = item.get("template-id") or item.get("template") or "unknown"
+        matched = item.get("matched-at") or item.get("host") or ""
+        key = (template, matched)
+
+        if key not in dedup:
+            dedup[key] = {
+                "template": template,
+                "name": info.get("name"),
+                "severity": (info.get("severity") or "info").lower(),
+                "type": info.get("type"),
+                "description": info.get("description"),
+                "matched_at": matched,
+                "host": item.get("host"),
+                "cves": sorted(set(cves)),
+                "tags": info.get("tags") or [],
+                "reference": info.get("reference"),
+                "occurrences": 1,
+            }
+        else:
+            dedup[key]["occurrences"] += 1
+            dedup[key]["cves"] = sorted(set(dedup[key]["cves"]) | set(cves))
+
+    rank = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "unknown": 0}
+    for f in dedup.values():
+        blob = " ".join([
+            f["name"] or "", f["template"], " ".join(f["tags"])
+        ]).lower()
+        if any(x in blob for x in ("exposure", "disclosure", "exposed", "directory-listing")):
+            category = "exposure"
+        elif any(x in blob for x in ("misconfig", "missing-", "cookie", "header")):
+            category = "misconfiguration"
+        elif f["cves"]:
+            category = "vulnerability"
+        elif any(x in blob for x in ("detect", "fingerprint", "tech-", "dns-", "ssl-")):
+            category = "fingerprint"
+        else:
+            category = "informational"
+        f["category"] = category
+        f["rank"] = rank.get(f["severity"], 0)
+
+    return sorted(dedup.values(), key=lambda x: (-x["rank"], x["name"] or ""))
+
+def searchsploit_cve(cve):
+    rc, stdout, _ = run_command(["searchsploit", "--cve", cve, "-j"], timeout=30)
+    if rc != 0 or not stdout.strip():
+        return []
+    try:
+        return json.loads(stdout).get("RESULTS_EXPLOIT") or []
+    except json.JSONDecodeError:
+        return []
+
+def correlate_cves(findings):
+    matches = []
+    for f in findings:
+        for cve in f.get("cves", []):
+            for e in searchsploit_cve(cve):
+                matches.append({
+                    "cve": cve, "finding": f["name"], "template": f["template"],
+                    "edb_id": e.get("EDB-ID"), "title": e.get("Title"),
+                    "date": e.get("Date_Published"), "type": e.get("Type"),
+                    "platform": e.get("Platform"), "path": e.get("Path"),
+                })
+    return matches
+
+def searchsploit_fingerprint(nmap_result):
+    candidates = []
+    for service in nmap_result.get("open_ports", []):
+        product = service.get("product")
+        version = service.get("version")
+        if not product:
+            continue
+        query = " ".join(x for x in (product, version) if x)
+        rc, stdout, _ = run_command(["searchsploit", query], timeout=30)
+        if rc != 0:
+            continue
+        for line in stdout.splitlines():
+            line = line.strip()
+            if "|" not in line:
+                continue
+            edb_id, title = [x.strip() for x in line.split("|", 1)]
+            if re.fullmatch(r"\d+", edb_id):
+                candidates.append({
+                    "port": service.get("port"), "product": product, "version": version,
+                    "edb_id": edb_id, "title": title, "confidence": "low",
+                    "note": "Fingerprint match only; verify exact product, version and configuration.",
+                })
+    return candidates
+
+def main():
+    p = argparse.ArgumentParser(description="Termux web security auditor v0.6")
+    p.add_argument("target", help="Authorized target URL or hostname")
+    p.add_argument("-o", "--output", default="audit-report.json")
+    args = p.parse_args()
+
+    target = args.target.strip()
+    if not target.startswith(("http://", "https://")):
+        target = "https://" + target
+    parsed = urlparse(target)
+    if not parsed.netloc:
+        print("ERROR: invalid target")
+        return 2
+
+    missing = [x for x in ("nmap", "nuclei", "searchsploit") if shutil.which(x) is None]
+    if missing:
+        print("ERROR: missing tool(s): " + ", ".join(missing))
+        return 2
+
+    workdir = Path(".audit-v0.6")
+    workdir.mkdir(exist_ok=True)
+
+    print(f"TERMUX SECURITY AUDIT v{VERSION}")
+    print("=" * 48)
+    print(f"Target: {target}\n")
+
+    print("[1/4] Discovering HTTP endpoints...")
+    urls, errors = discover(target)
+    discovery = {"urls": urls, "errors": errors, "max_urls": MAX_URLS, "max_depth": MAX_DEPTH}
+    (workdir / "discovery.json").write_text(
+        json.dumps(discovery, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"      Discovered URLs: {len(urls)}")
+
+    target_urls = list(dict.fromkeys([target] + [x["url"] for x in urls]))
+
+    print("[2/4] Running Nmap...")
+    nmap = run_nmap(parsed.hostname, workdir)
+    print(f"      Open ports: {len(nmap['open_ports'])}")
+
+    print("[3/4] Running Nuclei...")
+    nuclei_runs = run_nuclei(target, target_urls, workdir)
+    nuclei_files = [x["output"] for x in nuclei_runs if Path(x["output"]).exists()]
+    findings = load_nuclei(nuclei_files)
+    print(f"      Unique findings: {len(findings)}")
+
+    print("[4/4] Correlating CVEs with SearchSploit...")
+    cve_matches = correlate_cves(findings)
+    fingerprint = searchsploit_fingerprint(nmap)
+
+    severity = Counter(f["severity"] for f in findings)
+    categories = Counter(f["category"] for f in findings)
+    cves = sorted({c for f in findings for c in f.get("cves", [])})
+    important = [
+        {"severity": f["severity"], "category": f["category"], "name": f["name"],
+         "template": f["template"], "matched_at": f["matched_at"],
+         "cves": f["cves"], "occurrences": f["occurrences"]}
+        for f in findings if f["severity"] in ("critical", "high", "medium", "low")
+    ]
+
+    report = {
+        "version": VERSION,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "target": target,
+        "discovery": discovery,
+        "nmap": nmap,
+        "nuclei_runs": nuclei_runs,
+        "findings": findings,
+        "cve_exploitdb": cve_matches,
+        "fingerprint_candidates": fingerprint,
+        "summary": {
+            "discovered_urls": len(urls), "open_ports": len(nmap["open_ports"]),
+            "unique_findings": len(findings), "unique_cves": len(cves),
+            "severity": dict(severity), "category": dict(categories),
+            "important_findings": important,
+        },
+    }
+
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    print("\nAUDIT COMPLETE")
+    print("=" * 48)
+    print(f"Discovered URLs : {len(urls)}")
+    print(f"Open ports      : {len(nmap['open_ports'])}")
+    print(f"Findings        : {len(findings)}")
+    print(f"Unique CVEs     : {len(cves)}")
+    for s in ("critical", "high", "medium", "low", "info"):
+        print(f"{s.title():<16}: {severity.get(s, 0)}")
+    print(f"CVE/EDB matches : {len(cve_matches)}")
+    print(f"Fingerprint cand.: {len(fingerprint)}")
+    print(f"Report          : {output}")
+
+    if important:
+        print("\nIMPORTANT FINDINGS")
+        for f in important:
+            print(f"[{f['severity']}] {f['category']} | {f['name']} | {f['matched_at']}")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
