@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-termux-security-audit v0.6.1
+termux-security-audit v0.6.2
 Authorized web security audit pipeline for Termux:
 HTTP discovery -> Nmap -> Nuclei -> CVE extraction -> SearchSploit correlation.
 This tool reports evidence and candidates. It does not exploit targets.
@@ -20,7 +20,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 MAX_URLS = 150
 MAX_DEPTH = 2
 TIMEOUT = 10
@@ -141,7 +141,13 @@ def run_command(args, timeout=None):
     except FileNotFoundError:
         return 127, "", f"command not found: {args[0]}"
     except subprocess.TimeoutExpired as exc:
-        return 124, exc.stdout or "", (exc.stderr or "") + "\ncommand timed out"
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        return 124, stdout, stderr + "\ncommand timed out"
 
 def find_searchsploit():
     candidates = [
@@ -160,8 +166,10 @@ def find_searchsploit():
 def run_nmap(target, workdir):
     xml_path = workdir / "nmap.xml"
     rc, stdout, stderr = run_command(
-        ["nmap", "-Pn", "-sV", "-p", "80,443,8000,8008,8080,8443",
-         "-oX", str(xml_path), target], timeout=180)
+        ["nmap", "-4", "-Pn", "-T4", "-sV", "--version-light",
+         "--host-timeout", "90s",
+         "-p", "80,443,8000,8008,8080,8443",
+         "-oX", str(xml_path), target], timeout=120)
 
     services = []
     if xml_path.exists():
@@ -314,7 +322,7 @@ def searchsploit_fingerprint(nmap_result, searchsploit_bin):
     return candidates
 
 def main():
-    p = argparse.ArgumentParser(description="Termux web security auditor v0.6.1")
+    p = argparse.ArgumentParser(description="Termux web security auditor v0.6.2")
     p.add_argument("target", help="Authorized target URL or hostname")
     p.add_argument("-o", "--output", default="audit-report.json")
     args = p.parse_args()
