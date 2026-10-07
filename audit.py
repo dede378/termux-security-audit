@@ -20,7 +20,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
-VERSION = "0.7.1"
+VERSION = "0.8.1"
 MAX_URLS = 100
 MAX_DEPTH = 2
 TIMEOUT = 6
@@ -283,7 +283,6 @@ def run_nuclei(targets, workdir, deep=False):
     ]
     if not deep:
         args += ["-severity", "critical,high,medium,low"]
-    ]
     rc, stdout, stderr = run_command(args, timeout=900)
     return [{"mode": "selected", "returncode": rc, "stdout": stdout,
              "stderr": stderr, "output": str(output), "targets": len(targets),
