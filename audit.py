@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-termux-security-audit v0.8.0
+termux-security-audit v0.9.0
 Authorized web security audit pipeline for Termux:
 HTTP discovery -> Nmap -> Nuclei -> CVE extraction -> SearchSploit correlation.
 This tool reports evidence and candidates. It does not exploit targets.
@@ -17,12 +17,12 @@ from collections import Counter, deque
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl
 from urllib.request import Request, urlopen
 
-VERSION = "0.8.1"
+VERSION = "0.9.0"
 MAX_URLS = 100
-MAX_DEPTH = 2
+MAX_DEPTH = 3
 TIMEOUT = 6
 NUCLEI_MAX_TARGETS = 12
 NUCLEI_CONCURRENCY = 6
