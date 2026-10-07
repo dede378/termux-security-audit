@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-termux-security-audit v0.7.1
+termux-security-audit v0.8.0
 Authorized web security audit pipeline for Termux:
 HTTP discovery -> Nmap -> Nuclei -> CVE extraction -> SearchSploit correlation.
 This tool reports evidence and candidates. It does not exploit targets.
@@ -24,10 +24,10 @@ VERSION = "0.7.1"
 MAX_URLS = 100
 MAX_DEPTH = 2
 TIMEOUT = 6
-NUCLEI_MAX_TARGETS = 20
-NUCLEI_CONCURRENCY = 10
-NUCLEI_BULK_SIZE = 10
-NUCLEI_RATE_LIMIT = 20
+NUCLEI_MAX_TARGETS = 12
+NUCLEI_CONCURRENCY = 6
+NUCLEI_BULK_SIZE = 6
+NUCLEI_RATE_LIMIT = 10
 
 COMMON_PATHS = [
     "/robots.txt", "/sitemap.xml", "/login", "/login.php", "/admin",
@@ -270,7 +270,7 @@ def select_nuclei_targets(target, urls, parameters):
             break
     return selected
 
-def run_nuclei(targets, workdir):
+def run_nuclei(targets, workdir, deep=False):
     target_file = workdir / "nuclei_targets.txt"
     target_file.write_text("\n".join(targets) + "\n", encoding="utf-8")
     output = workdir / "nuclei.jsonl"
@@ -278,8 +278,11 @@ def run_nuclei(targets, workdir):
         "nuclei", "-list", str(target_file), "-jsonl", "-o", str(output),
         "-c", str(NUCLEI_CONCURRENCY),
         "-bs", str(NUCLEI_BULK_SIZE),
-        "-rl", str(NUCLEI_RATE_LIMIT),
-        "-stats", "-si", "15",
+        "-rl", str(NUCLEI_RATE_LIMIT if not deep else 20),
+        "-stats", "-si", "10",
+    ]
+    if not deep:
+        args += ["-severity", "critical,high,medium,low"]
     ]
     rc, stdout, stderr = run_command(args, timeout=900)
     return [{"mode": "selected", "returncode": rc, "stdout": stdout,
@@ -396,9 +399,10 @@ def searchsploit_fingerprint(nmap_result, searchsploit_bin):
     return candidates
 
 def main():
-    p = argparse.ArgumentParser(description="Termux web security auditor v0.7.1")
+    p = argparse.ArgumentParser(description="Termux web security auditor v0.8.0")
     p.add_argument("target", help="Authorized target URL or hostname")
     p.add_argument("-o", "--output", default="audit-report.json")
+    p.add_argument("--deep", action="store_true", help="include informational/fingerprint findings; slower")
     args = p.parse_args()
 
     target = args.target.strip()
@@ -418,7 +422,7 @@ def main():
         print("SearchSploit lookup paths: PATH, ~/bin/searchsploit, ~/exploit-database/searchsploit")
         return 2
 
-    workdir = Path(".audit-v0.7.1")
+    workdir = Path(".audit-v0.8.0")
     workdir.mkdir(exist_ok=True)
 
     print(f"TERMUX SECURITY AUDIT v{VERSION}")
@@ -436,14 +440,17 @@ def main():
     print(f"      Parameterized endpoints: {len(parameters)}")
 
     target_urls = select_nuclei_targets(target, urls, parameters)
+    if not args.deep:
+        target_urls = target_urls[:NUCLEI_MAX_TARGETS]
     print(f"      Nuclei targets selected: {len(target_urls)} (max {NUCLEI_MAX_TARGETS})")
+    print("      Nuclei mode: " + ("DEEP" if args.deep else "FAST"))
 
     print("[2/4] Running Nmap...")
     nmap = run_nmap(parsed.hostname, workdir)
     print(f"      Open ports: {len(nmap['open_ports'])}")
 
     print("[3/4] Running Nuclei...")
-    nuclei_runs = run_nuclei(target_urls, workdir)
+    nuclei_runs = run_nuclei(target_urls, workdir, deep=args.deep)
     nuclei_files = [x["output"] for x in nuclei_runs if Path(x["output"]).exists()]
     findings = load_nuclei(nuclei_files)
     print(f"      Unique findings: {len(findings)}")
