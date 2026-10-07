@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-termux-security-audit v0.6.2
+termux-security-audit v0.7.0
 Authorized web security audit pipeline for Termux:
 HTTP discovery -> Nmap -> Nuclei -> CVE extraction -> SearchSploit correlation.
 This tool reports evidence and candidates. It does not exploit targets.
@@ -20,9 +20,9 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
-VERSION = "0.6.2"
+VERSION = "0.7.0"
 MAX_URLS = 150
-MAX_DEPTH = 2
+MAX_DEPTH = 3
 TIMEOUT = 10
 
 COMMON_PATHS = [
@@ -38,6 +38,7 @@ class LinkParser(HTMLParser):
         super().__init__()
         self.links = []
         self.forms = []
+        self.parameters = []
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
@@ -52,6 +53,10 @@ class LinkParser(HTMLParser):
         elif tag == "form":
             value = attrs.get("action") or ""
             self.forms.append(value)
+        elif tag in ("input", "textarea", "select"):
+            name = attrs.get("name")
+            if name:
+                self.parameters.append(name)
 
 def normalize_url(base, value):
     if not value:
@@ -77,9 +82,23 @@ def fetch(url):
     with urlopen(req, timeout=TIMEOUT) as r:
         return r.geturl(), r.status, r.headers.get("Content-Type", ""), r.read()
 
+def extract_candidates(base_url, body):
+    text = body.decode("utf-8", errors="ignore")
+    parser = LinkParser()
+    parser.feed(text)
+    raw_values = parser.links + parser.forms
+    raw_values += re.findall(r"""(?:href|src|action)\\s*=\\s*["']([^"']+)["']""", text, re.I)
+    urls = []
+    for raw in raw_values:
+        child = normalize_url(base_url, raw)
+        if child:
+            urls.append(child)
+    return list(dict.fromkeys(urls)), parser.parameters
+
 def discover(target):
     queue = deque([(target, 0)])
     seen, discovered, errors = set(), [], []
+    parameters = {}
 
     while queue and len(discovered) < MAX_URLS:
         current, depth = queue.popleft()
@@ -95,19 +114,19 @@ def discover(target):
 
         final_url = normalize_url(target, final_url) or current
         seen.add(final_url)
-        discovered.append({
-            "url": final_url, "depth": depth, "status": status,
-            "content_type": content_type, "source": "crawl"
-        })
+        discovered.append({"url": final_url, "depth": depth, "status": status,
+                           "content_type": content_type, "source": "crawl"})
 
-        if depth >= MAX_DEPTH or "html" not in content_type.lower():
+        sample = body[:4096].lower()
+        looks_html = "html" in content_type.lower() or b"<html" in sample or b"<body" in sample or b"<a " in sample
+        if not looks_html or depth >= MAX_DEPTH:
             continue
 
-        parser = LinkParser()
-        parser.feed(body.decode("utf-8", errors="ignore"))
-        for raw in parser.links + parser.forms:
-            child = normalize_url(final_url, raw)
-            if child and same_origin(child, target) and child not in seen:
+        children, names = extract_candidates(final_url, body)
+        if names:
+            parameters[final_url] = sorted(set(names))
+        for child in children:
+            if same_origin(child, target) and child not in seen:
                 queue.append((child, depth + 1))
 
     for path in COMMON_PATHS:
@@ -117,22 +136,51 @@ def discover(target):
         if not candidate or candidate in seen:
             continue
         try:
-            final_url, status, content_type, _ = fetch(candidate)
+            final_url, status, content_type, body = fetch(candidate)
             final_url = normalize_url(target, final_url) or candidate
             seen.update((candidate, final_url))
-            discovered.append({
-                "url": final_url, "depth": 1, "status": status,
-                "content_type": content_type, "source": "common-path"
-            })
+            discovered.append({"url": final_url, "depth": 1, "status": status,
+                               "content_type": content_type, "source": "common-path"})
+            sample = body[:4096].lower()
+            if "html" in content_type.lower() or b"<html" in sample:
+                children, names = extract_candidates(final_url, body)
+                if names:
+                    parameters[final_url] = sorted(set(names))
+                for child in children:
+                    if same_origin(child, target) and child not in seen:
+                        queue.append((child, 2))
         except Exception as exc:
             errors.append({"url": candidate, "error": str(exc)})
+
+    while queue and len(discovered) < MAX_URLS:
+        current, depth = queue.popleft()
+        current = normalize_url(target, current)
+        if not current or current in seen or not same_origin(current, target):
+            continue
+        seen.add(current)
+        try:
+            final_url, status, content_type, body = fetch(current)
+            final_url = normalize_url(target, final_url) or current
+            seen.add(final_url)
+            discovered.append({"url": final_url, "depth": depth, "status": status,
+                               "content_type": content_type, "source": "crawl"})
+            sample = body[:4096].lower()
+            if depth < MAX_DEPTH and ("html" in content_type.lower() or b"<html" in sample):
+                children, names = extract_candidates(final_url, body)
+                if names:
+                    parameters[final_url] = sorted(set(names))
+                for child in children:
+                    if same_origin(child, target) and child not in seen:
+                        queue.append((child, depth + 1))
+        except Exception as exc:
+            errors.append({"url": current, "error": str(exc)})
 
     unique, used = [], set()
     for item in discovered:
         if item["url"] not in used:
             used.add(item["url"])
             unique.append(item)
-    return unique[:MAX_URLS], errors
+    return unique[:MAX_URLS], errors, parameters
 
 def run_command(args, timeout=None):
     try:
@@ -322,7 +370,7 @@ def searchsploit_fingerprint(nmap_result, searchsploit_bin):
     return candidates
 
 def main():
-    p = argparse.ArgumentParser(description="Termux web security auditor v0.6.2")
+    p = argparse.ArgumentParser(description="Termux web security auditor v0.7.0")
     p.add_argument("target", help="Authorized target URL or hostname")
     p.add_argument("-o", "--output", default="audit-report.json")
     args = p.parse_args()
@@ -344,7 +392,7 @@ def main():
         print("SearchSploit lookup paths: PATH, ~/bin/searchsploit, ~/exploit-database/searchsploit")
         return 2
 
-    workdir = Path(".audit-v0.6")
+    workdir = Path(".audit-v0.7")
     workdir.mkdir(exist_ok=True)
 
     print(f"TERMUX SECURITY AUDIT v{VERSION}")
@@ -353,11 +401,13 @@ def main():
     print(f"SearchSploit: {searchsploit_bin}\n")
 
     print("[1/4] Discovering HTTP endpoints...")
-    urls, errors = discover(target)
-    discovery = {"urls": urls, "errors": errors, "max_urls": MAX_URLS, "max_depth": MAX_DEPTH}
+    urls, errors, parameters = discover(target)
+    discovery = {"urls": urls, "errors": errors, "parameters": parameters,
+                 "max_urls": MAX_URLS, "max_depth": MAX_DEPTH}
     (workdir / "discovery.json").write_text(
         json.dumps(discovery, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"      Discovered URLs: {len(urls)}")
+    print(f"      Parameterized endpoints: {len(parameters)}")
 
     target_urls = list(dict.fromkeys([target] + [x["url"] for x in urls]))
 
@@ -396,7 +446,8 @@ def main():
         "cve_exploitdb": cve_matches,
         "fingerprint_candidates": fingerprint,
         "summary": {
-            "discovered_urls": len(urls), "open_ports": len(nmap["open_ports"]),
+            "discovered_urls": len(urls), "parameterized_endpoints": len(parameters),
+            "open_ports": len(nmap["open_ports"]),
             "unique_findings": len(findings), "unique_cves": len(cves),
             "severity": dict(severity), "category": dict(categories),
             "important_findings": important,
@@ -410,6 +461,7 @@ def main():
     print("\nAUDIT COMPLETE")
     print("=" * 48)
     print(f"Discovered URLs : {len(urls)}")
+    print(f"Parameterized   : {len(parameters)}")
     print(f"Open ports      : {len(nmap['open_ports'])}")
     print(f"Findings        : {len(findings)}")
     print(f"Unique CVEs     : {len(cves)}")
