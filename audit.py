@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-termux-security-audit v0.6
+termux-security-audit v0.6.1
 Authorized web security audit pipeline for Termux:
 HTTP discovery -> Nmap -> Nuclei -> CVE extraction -> SearchSploit correlation.
 This tool reports evidence and candidates. It does not exploit targets.
 """
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -19,7 +20,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
-VERSION = "0.6"
+VERSION = "0.6.1"
 MAX_URLS = 150
 MAX_DEPTH = 2
 TIMEOUT = 10
@@ -70,7 +71,7 @@ def same_origin(url, origin):
 
 def fetch(url):
     req = Request(url, headers={
-        "User-Agent": "termux-security-audit/0.6",
+        "User-Agent": f"termux-security-audit/{VERSION}",
         "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
     })
     with urlopen(req, timeout=TIMEOUT) as r:
@@ -141,6 +142,20 @@ def run_command(args, timeout=None):
         return 127, "", f"command not found: {args[0]}"
     except subprocess.TimeoutExpired as exc:
         return 124, exc.stdout or "", (exc.stderr or "") + "\ncommand timed out"
+
+def find_searchsploit():
+    candidates = [
+        shutil.which("searchsploit"),
+        str(Path.home() / "bin" / "searchsploit"),
+        str(Path.home() / "exploit-database" / "searchsploit"),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+    return None
 
 def run_nmap(target, workdir):
     xml_path = workdir / "nmap.xml"
@@ -252,8 +267,8 @@ def load_nuclei(files):
 
     return sorted(dedup.values(), key=lambda x: (-x["rank"], x["name"] or ""))
 
-def searchsploit_cve(cve):
-    rc, stdout, _ = run_command(["searchsploit", "--cve", cve, "-j"], timeout=30)
+def searchsploit_cve(cve, searchsploit_bin):
+    rc, stdout, _ = run_command([searchsploit_bin, "--cve", cve, "-j"], timeout=30)
     if rc != 0 or not stdout.strip():
         return []
     try:
@@ -261,11 +276,11 @@ def searchsploit_cve(cve):
     except json.JSONDecodeError:
         return []
 
-def correlate_cves(findings):
+def correlate_cves(findings, searchsploit_bin):
     matches = []
     for f in findings:
         for cve in f.get("cves", []):
-            for e in searchsploit_cve(cve):
+            for e in searchsploit_cve(cve, searchsploit_bin):
                 matches.append({
                     "cve": cve, "finding": f["name"], "template": f["template"],
                     "edb_id": e.get("EDB-ID"), "title": e.get("Title"),
@@ -274,7 +289,7 @@ def correlate_cves(findings):
                 })
     return matches
 
-def searchsploit_fingerprint(nmap_result):
+def searchsploit_fingerprint(nmap_result, searchsploit_bin):
     candidates = []
     for service in nmap_result.get("open_ports", []):
         product = service.get("product")
@@ -282,7 +297,7 @@ def searchsploit_fingerprint(nmap_result):
         if not product:
             continue
         query = " ".join(x for x in (product, version) if x)
-        rc, stdout, _ = run_command(["searchsploit", query], timeout=30)
+        rc, stdout, _ = run_command([searchsploit_bin, query], timeout=30)
         if rc != 0:
             continue
         for line in stdout.splitlines():
@@ -299,7 +314,7 @@ def searchsploit_fingerprint(nmap_result):
     return candidates
 
 def main():
-    p = argparse.ArgumentParser(description="Termux web security auditor v0.6")
+    p = argparse.ArgumentParser(description="Termux web security auditor v0.6.1")
     p.add_argument("target", help="Authorized target URL or hostname")
     p.add_argument("-o", "--output", default="audit-report.json")
     args = p.parse_args()
@@ -312,9 +327,13 @@ def main():
         print("ERROR: invalid target")
         return 2
 
-    missing = [x for x in ("nmap", "nuclei", "searchsploit") if shutil.which(x) is None]
+    searchsploit_bin = find_searchsploit()
+    missing = [x for x in ("nmap", "nuclei") if shutil.which(x) is None]
+    if not searchsploit_bin:
+        missing.append("searchsploit")
     if missing:
         print("ERROR: missing tool(s): " + ", ".join(missing))
+        print("SearchSploit lookup paths: PATH, ~/bin/searchsploit, ~/exploit-database/searchsploit")
         return 2
 
     workdir = Path(".audit-v0.6")
@@ -322,7 +341,8 @@ def main():
 
     print(f"TERMUX SECURITY AUDIT v{VERSION}")
     print("=" * 48)
-    print(f"Target: {target}\n")
+    print(f"Target: {target}")
+    print(f"SearchSploit: {searchsploit_bin}\n")
 
     print("[1/4] Discovering HTTP endpoints...")
     urls, errors = discover(target)
@@ -344,8 +364,8 @@ def main():
     print(f"      Unique findings: {len(findings)}")
 
     print("[4/4] Correlating CVEs with SearchSploit...")
-    cve_matches = correlate_cves(findings)
-    fingerprint = searchsploit_fingerprint(nmap)
+    cve_matches = correlate_cves(findings, searchsploit_bin)
+    fingerprint = searchsploit_fingerprint(nmap, searchsploit_bin)
 
     severity = Counter(f["severity"] for f in findings)
     categories = Counter(f["category"] for f in findings)
