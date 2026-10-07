@@ -1,142 +1,101 @@
 # termux-security-audit
 
-Lightweight HTTP security configuration auditor for Termux.
+Lightweight web security auditor for Termux, with a Nmap + Nuclei + SearchSploit pipeline.
 
-## Purpose
+## v0.6
 
-`termux-security-audit` checks a website's HTTP response for common security controls and configuration weaknesses. It is designed as a fast first-pass audit before deeper testing with tools such as Nmap, Nuclei, Nikto, or manual application testing.
+Version 0.6 adds endpoint discovery, Nmap service enumeration, Nuclei scanning, CVE extraction, and local Exploit-DB/SearchSploit correlation.
 
-This project is **defensive and educational**. Use it only against systems you own or are explicitly authorized to test.
+The scanner reports evidence and candidates. It does **not** automatically exploit targets.
 
-## Current checks
+## Pipeline
 
-- HTTP status and final URL
-- HTTPS
-- Strict-Transport-Security (HSTS)
-- Content-Security-Policy (CSP)
-- Clickjacking protection via X-Frame-Options or CSP frame-ancestors
-- X-Content-Type-Options
-- Referrer-Policy
-- Permissions-Policy
-- Cross-Origin-Opener-Policy (COOP)
-- Cross-Origin-Resource-Policy (CORP)
-- CORS wildcard detection
-- Basic cookie security flags: Secure, HttpOnly, SameSite
-- Server / X-Powered-By information disclosure
-- PASS / WARN / FAIL / INFO summary
-- Basic configuration score
+\`\`\`text
+TARGET
+  |
+  +-- HTTP endpoint discovery
+  +-- Nmap service/version scan
+  +-- Nuclei direct scan
+  +-- Nuclei discovered-endpoint scan
+  +-- Deduplication + classification
+  +-- CVE extraction
+  +-- SearchSploit / Exploit-DB correlation
+  +-- audit-report.json
+\`\`\`
 
-## Important classification rule
-
-The scanner does **not** claim that a missing security header automatically proves a vulnerability.
-
-For example, missing CSP is reported as a configuration weakness/indicator, not automatically as confirmed XSS. Application-level vulnerabilities require separate evidence and testing.
+A discovery failure no longer prevents the direct Nuclei scan. The target itself is always included.
 
 ## Requirements
 
 Termux with:
 
-- bash
-- curl
-- standard Unix utilities
-
-Install the main dependency with:
-
-```bash
-pkg update
-pkg install curl
-```
+- Python 3
+- Nmap
+- Nuclei
+- SearchSploit / Exploit-DB
 
 ## Installation
 
-Clone the repository:
-
-```bash
+\`\`\`bash
 git clone https://github.com/dede378/termux-security-audit.git
 cd termux-security-audit
-chmod +x audit_headers.sh
-```
+chmod +x audit.py
+\`\`\`
+
+Update later:
+
+\`\`\`bash
+git pull --ff-only
+\`\`\`
 
 ## Usage
 
-Audit a single HTTPS target:
+\`\`\`bash
+python3 audit.py https://example.com
+\`\`\`
 
-```bash
-./audit_headers.sh https://example.com
-```
+Custom report:
 
-HTTP targets are also accepted:
+\`\`\`bash
+python3 audit.py https://example.com -o reports/example.json
+\`\`\`
 
-```bash
-./audit_headers.sh http://example.com
-```
+Temporary files are kept under \`.audit-v0.6/\`.
 
-## Example output
+## Discovery
 
-```text
-SECURITY HEADERS
-──────────────────────────────────────────────
-[PASS] HSTS                         configured
-[WARN] Content-Security-Policy      missing
-[PASS] Clickjacking protection      X-Frame-Options
-[PASS] X-Content-Type-Options       nosniff
-[PASS] Referrer-Policy              configured
-[FAIL] Permissions-Policy           missing
+The HTTP discovery layer:
 
-CORS
-──────────────────────────────────────────────
-[WARN] CORS                        wildcard (*)
+- follows same-origin links
+- reads form actions
+- keeps query parameters such as \`?id=1\`
+- removes URL fragments
+- probes a small list of common paths
+- limits crawling to 150 URLs and depth 2
+- records errors without aborting the audit
 
-SUMMARY
-══════════════════════════════════════════════
-PASS : 4
-WARN : 2
-FAIL : 1
-INFO : 2
+## Report
 
-Score  : 71/100
-Rating : NEEDS IMPROVEMENT
-```
+The JSON report contains:
 
-## Finding severity
+- discovered URLs and discovery errors
+- Nmap open ports and service fingerprints
+- Nuclei findings
+- severity and category
+- repeated-finding count
+- detected CVEs
+- SearchSploit results for detected CVEs
+- low-confidence SearchSploit fingerprint candidates
+- raw command results
+- summary counts
 
-The first version intentionally focuses on **configuration evidence** rather than aggressive exploitation.
+## Interpretation
 
-Typical findings include:
+A Nuclei finding is evidence from a template, not automatically proof of an exploitable vulnerability.
 
-- Security Misconfiguration
-- Missing browser security controls
-- CORS configuration weakness
-- Cookie security weakness
-- Information disclosure indicators
+A SearchSploit product/version match is only a candidate. Verify the affected product, exact version, configuration, and applicability before treating an exploit as relevant.
 
-Future versions can add structured CWE mappings, evidence records, batch scanning, JSON output, HTML reports, and integration with other authorized security tools.
-
-## Project roadmap
-
-### v1.0
-
-- Single-target HTTP header audit
-- Clear terminal output
-- Basic score
-- Cookie/CORS checks
-- README and safe output exclusions
-
-### Planned
-
-- Batch domain input
-- JSON reports
-- HTML reports
-- CWE mapping
-- Severity and confidence fields
-- Evidence collection
-- TLS checks
-- Additional exposure checks
-- Optional integration with Nuclei/Nmap
-
-## Legal and ethical use
-
-Only scan systems for which you have permission. Do not use this project to bypass authentication, exploit vulnerabilities, access private data, or disrupt services.
+Only scan systems you own or have explicit permission to test.
 
 ## License
 
